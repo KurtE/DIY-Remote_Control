@@ -18,7 +18,7 @@
 USE_XPOTS con 1
 USE_OLD_TASEROUT con 1
 XBEEONHSERIAL con 1			; removed non-hserial version from here, but support functions still have it!!!
-DataPacketDeltaMS con 33	; how many MS to wait between sending messages.  This is about 30 per second
+DEFAULT_DataPacketDeltaMS con 33	; how many MS to wait between sending messages.  This is about 30 per second
 ; 
 ;Hardware setup: ABB2 with ATOM 28 Pro, XBee, 2 joysticks, 2 sliders, HEX keypad, display 
 ; 
@@ -86,6 +86,7 @@ RowB		con	17				; Cmd buttons new row
 ;==============================================================================
 JoystickRangesDMStart	con	0x0		; 12 bytes - Stores Mins/Maxs of joysticks/sliders
 XBeeDMStart				con	0x80	; 4 Bytes - Stores the XBee My and DL we want
+									; 1 bytes - delay time in ms  
 
 XBeeNDDMCache			con	0x88	; 2 bytes - (count and checksum) How many items do we have cached out
 									; followed by My array, SNL, SNH, and text strings... reserve 220 bytes for this!
@@ -111,24 +112,24 @@ TMODE_SELECTMY			con 4					; Change My address
 TMODE_SELECTMY			con 3					; Change My address
 #endif
 TMODE_CALIBRATE			con	(TMODE_SELECTMY+1)	; try to calibrate the joysticks...
-
+TMODE_SEND_DELAY		con (TMODE_SELECTMY+2)
 #ifdef USE_XPOTS
-TMODE_SETXPZONE			con (TMODE_CALIBRATE+1)
+TMODE_SETXPZONE			con (TMODE_SEND_DELAY+1)
 TMODE_MAX				con	TMODE_SETXPZONE					; What is our max mode
 #else
-TMODE_MAX				con	TMODE_CALIBRATE					; What is our max mode
+TMODE_MAX				con	TMODE_SEND_DELAY					; What is our max mode
 #endif
 TransMode = TMODE_NORMAL						; Initialize to normal display mode
 fTmodeChanged = FALSE							; the mode has not changed.
 bTDataLast				var	byte				; which is the last data we displayed
 
 ; Strings we use to display on the LCD
-_KEYSTRING				bytetable "Key:   "						
-_LJOYSTRING				bytetable "Left:  "
-_RJOYSTRING				bytetable "Right: "
-_SLIDESTRING			bytetable "Slide: "
+_KEYSTRING				bytetable "Key:  "						
+_LJOYSTRING				bytetable "Left: "
+_RJOYSTRING				bytetable "Right:"
+_SLIDESTRING			bytetable "Slide:"
 #ifdef USE_XPOTS
-_POTSTRING				bytetable "Pot:   " ;XP
+_POTSTRING				bytetable "Pot:  " ;XP
 #endif
 _BLANKS					bytetable "                "	; setup for one whole line worth
 _LCDLINE2				bytetable 254, 71, 1, 2	; Position to first character in line 2
@@ -145,6 +146,8 @@ fNewPacketMsgMode		var	bit			; Are we in New Packet Message Mode?
 fNewPacketMsgSent		var	bit			; Have we already sent a new Packet Msg?
 lTimerLastDataPacket	var long = 0		; Time we sent last data packet
 lTimerCur				var long		; Current time
+;
+DataPacketDeltaMS 		var byte		; how many MS to wait between sending messages.  This is about 30 per second
 
 ; Other defines for Xbee
 MYADDR					con	$0
@@ -266,6 +269,7 @@ abLCDUpdY				bytetable  2,  1, 2, 1, 2, 1		; " 1, 1
 #endif
 
 abDispValCols			bytetable 0, 6, 13
+g_bTxStatus				var byte
 g_bTxStatusLast 		var byte = 99;
 
 ; Text tables
@@ -307,6 +311,7 @@ sums = rep 0\CNT_SUMS
 index = 0 
 CmdBtns = 0			; Assumume no command button has been pressed
 
+DataPacketDeltaMS = DEFAULT_DataPacketDeltaMS	; how many MS to wait between sending messages.  This is about 30 per second
 Calibrated = 0 ; Mark for calibration
 bTDataLast = 0xff	; none of the above...
 
@@ -383,6 +388,9 @@ start:
 	if TransMode = TMODE_CALIBRATE then	
 		gosub CalibrateJoySticks
 		goto start								; Will wait for new mode...
+	elseif TransMode = TMODE_SEND_DELAY			; Allow us to configure how fast we send packets
+		gosub ConfigureSendDelay
+		goto start	
 #ifdef USE_OLD_SELECT_DL
 	elseif TransMode = TMODE_SELECTDL
 		gosub UserSelectDL
@@ -473,7 +481,7 @@ start:
 		endif
 #endif		
 ; for now try without zero stuff...
-;		bPacket(5) = ((((sums(3) min AToDMinT8(3)) - AToDMinT8(3)) * 256) / (AtoDMaxT8(3)-AToDMinT8(3))) max 255	;
+		bPacket(5) = ((((sums(3) min AToDMinT8(3)) - AToDMinT8(3)) * 256) / (AtoDMaxT8(3)-AToDMinT8(3))) max 255	;
 		
 ;		bPacket(5) = ((((((sums(3) + SumOffsets(3)) min (AToDMins(3)*8)) / 8) - AToDMins(3)) * 256) / AToDRanges(3)) max 255	;
 		
@@ -548,6 +556,15 @@ start:
 			; update the display module 
 			gosub CheckAndTransmitDataPacket ; check before and after we output to the LCD
 
+			; see about displaying transmitter status...
+			if g_bTxStatus <> g_bTxStatusLast then
+				g_bTxStatusLast = g_bTxStatus;
+				if g_bTxStatus then 
+					gosub DoLCDDisplay[1, 1, 32, 0]	;  display a blank showing we don't have 
+				else	
+					gosub DoLCDDisplay[1, 1, 42, 0]	;  display a * to show we are talking to robot...
+				endif
+			endif
 			; Now depending on which mode we are displaying we will either simply display the state of the Joysticks...
 			if TransMode = TMODE_NORMAL then
 				;XP:
@@ -567,7 +584,7 @@ start:
 				if (fPacketChanged & %0000000000000011) then ; last 2 bits are for keys
 					if bTDataLast <> 0 then
 						bTDataLast = 0
-						gosub ShowLCDString[1, 1, @_KEYSTRING, 7]
+						gosub ShowLCDString[2, 1, @_KEYSTRING, 6]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
 						gosub TASerout[Display, i19200, @_blanks, 9]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
@@ -579,7 +596,7 @@ start:
 				elseif (fPacketChanged & %0000000000001100)	; R Joystick X, Y
 					if bTDataLast <> 1 then
 						bTDataLast = 1
-						gosub ShowLCDString[1, 1, @_RJOYSTRING, 7]
+						gosub ShowLCDString[2, 1, @_RJOYSTRING, 6]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
 						gosub TASerout[Display, i19200, @_blanks, 9]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
@@ -592,7 +609,7 @@ start:
 				elseif (fPacketChanged & %0000000000110000)	; L Joystick X, Y
 					if bTDataLast <> 2 then
 						bTDataLast = 2
-						gosub ShowLCDString[1, 1, @_LJOYSTRING, 7]
+						gosub ShowLCDString[2, 1, @_LJOYSTRING, 6]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
 						gosub TASerout[Display, i19200, @_blanks, 9]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
@@ -605,7 +622,7 @@ start:
 				elseif (fPacketChanged & %0000000011000000)	; Sliders R, L
 					if bTDataLast <> 3 then
 						bTDataLast = 3
-						gosub ShowLCDString[1, 1, @_SLIDESTRING, 7]
+						gosub ShowLCDString[2, 1, @_SLIDESTRING, 6]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
 						gosub TASerout[Display, i19200, @_blanks, 9]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
@@ -619,7 +636,7 @@ start:
 				elseif (fPacketChanged & %0000001100000000)	; Potmeter R, L
 					if bTDataLast <> 4 then
 						bTDataLast = 4
-						gosub ShowLCDString[1, 1, @_POTSTRING, 7]
+						gosub ShowLCDString[2, 1, @_POTSTRING, 6]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
 						gosub TASerout[Display, i19200, @_blanks, 9]
 						gosub CheckAndTransmitDataPacket ; check after each string we send...
@@ -1125,12 +1142,12 @@ CheckAndTransmitDataPacket:
 		ElseIf _bAPIPacket(0) = 0x89
 			' this is an A TX Status message - May check status and maybe update something?
 			' We can detect that someone is receiving data from us here.
-	        g_bTxStatusLast = _bAPIPacket(2);
+	        g_bTxStatus = _bAPIPacket(2);
 			goto CheckAndTransmitDataPacket
 
 		ElseIf _bAPIPacket(0) = 0x88
 			' Api Status
-	        g_bTxStatusLast = _bAPIPacket(2);
+	        g_bTxStatus = _bAPIPacket(2);
 			goto CheckAndTransmitDataPacket
 		
 		Else
@@ -1199,15 +1216,20 @@ GetSavedXBeeInfo:
 
 	ReadDm	XBeeDMStart, [cbXBee, bXBeeCS]
 
-	if cbXBee = 4 then
-		ReadDm XBeeDMStart+2, [str XbeeEE\cbXBee]
+; 
+	if (cbXBee = 4) or (cbXBee = 5) then
+		ReadDm XBeeDMStart+2, [str XbeeEE\4]
 #ifdef DEBUG_SAVED_LIST
 		serout s_out, i9600, ["My: ", hex xBeeMy, " DL: ", hex XBeeDL, 13]
 #endif		
 		
-		for i = 0 to cbXBee/2
+		for i = 0 to 1
 			bXBeeCS = bXBeeCS - (XBeeEE(i).lowbyte + XBeeEE(i).highbyte)
 		next
+		if cbXBee = 5 then
+			ReadDm XBeeDMStart+6, [DataPacketDeltaMS]		; read in our time delay...
+			bXBeeCS = bXBeeCS - DataPacketDeltaMS
+		endif
 		
 		; If I did the right if valid the cs should be zero
 		if bXBeeCS = 0 then
@@ -1218,6 +1240,7 @@ GetSavedXBeeInfo:
 	; if we fail for some reason just default to our defaults...
 	XBeeMy = MYADDR
 	XBeeDL = DESTADDR
+	DataPacketDeltaMS = DEFAULT_DataPacketDeltaMS
 
 	return
 	
@@ -1228,12 +1251,12 @@ GetSavedXBeeInfo:
 ;		We will start at EEPROM location: 0x80	
 ;==============================================================================
 SaveXBeeInfo:
-	bXBeeCS = 0
+	bXBeeCS = DataPacketDeltaMS
 	for i = 0 to 1
 		bXBeeCS = bXBeeCS + (XBeeEE(i).lowbyte + XBeeEE(i).highbyte)
 	next
 	
-	WriteDM XBeeDMStart, [4, bXBeeCS, str XBeeEE\4]
+	WriteDM XBeeDMStart, [5, bXBeeCS, str XBeeEE\4, DataPacketDeltaMS]
 	
 	return
 	
@@ -1897,6 +1920,79 @@ _STDLN_LOOP:
 	goto _STDLN_LOOP
 
 ;==============================================================================
+;[ConfigureSendDelay] - This function allows us to configure how fast the 
+;	packets are sent...
+;==============================================================================
+_SSD_Prompt0	bytetable	254, 71, 0, 1, "Packets ms: "   ;  16
+_SSD_Prompt1	bytetable	254, 71, 0, 2, "New:"			;  8
+_SSD_POS_NEW	bytetable	254, 71, 5, 2
+;local variables
+ConfigureSendDelay:
+_USSD_AGAIN:
+	; bugbug: May need to to use our TASerout ...
+	gosub TASerout[Display, i19200, @_SSD_Prompt0, 16]
+	bTemp = dec4 DataPacketDeltaMS\4
+	gosub TASerout[Display, i19200, @bTemp, 4]				; output the current MY
+
+	; display the second line of text...
+	gosub TASerout[Display, i19200, @_SSD_Prompt1, 8]
+
+	wNewVal = 0			; Start off at zero
+	fChanged = FALSE	;
+
+_USSD_LOOP:
+	bPacketPrev(0) = bPacket(0)	; need to save old state...
+	bPacketPrev(1) = bPacket(1)
+	
+	gosub CheckKeypad[TRUE]		; Will try go get something from keypad may change mode
+		
+	; See if we changed modes
+	if fTModeChanged then
+		bPacketPrev(0) = bPacket(0)	; Make sure the main loop has our updated state of keys!
+		bPacketPrev(1) = bPacket(1)
+		return
+	endif
+	
+	; Check to see if the Enter or Cancel have been pressed.
+	if (CmdBtns & CMD_ENTER_MASK) and ((CmdBtnsPrev & CMD_ENTER_MASK) = 0) then
+		if fChanged then 
+			; only save if something actually was entered.
+			DataPacketDeltaMS = wNewVal
+			gosub SaveXBeeInfo			; Save it away in EEPROM
+			goto _USSD_AGAIN				; go back and display the new data.
+		endif
+	elseif (CmdBtns & CMD_ESC_MASK) and ((CmdBtnsPrev & CMD_ESC_MASK) = 0)
+		fChanged = FALSE
+		wNewVal = 0			; reset
+		gosub TASerout[Display, i19200, @_SSD_POS_NEW, 4]
+		bTemp = dec4 wNewVal\4
+		gosub TASerout[Display, i19200, @bTemp, 4]				; output the current MY
+	endif
+
+	; Now check to see if any of the other keys have been pressed. quick test to see if a button pressed
+	; and likely that it was not the same as the last pass...
+	if ((bPacket(0) <> bPacketPrev(0)) and bPacket(0)) or ((bPacket(1) <> bPacketPrev(1)) and bPacket(1)) then
+		for i = 0 to 7
+			bMask = 1 << i
+			if (bPacket(0) & bMask) and ((bPacketPrev(0) & bMask) = 0) then
+				wNewVal = wNewVal * 10 + i
+				fChanged = TRUE
+			elseif (bPacket(1) & bMask) and ((bPacketPrev(1) & bMask) = 0)
+				wNewVal = wNewVal * 10 + i + 8	; Takes care of 8-F
+				fChanged = TRUE
+			endif
+		next
+		
+		; Display new number.  May actuall not be new yet, but...
+		gosub TASerout[Display, i19200, @_SSD_POS_NEW, 4]
+		bTemp = dec4 wNewVal\4
+		gosub TASerout[Display, i19200, @bTemp, 4]				; output the current MY
+	endif
+
+	; And try again...
+	goto _USSD_LOOP
+
+;==============================================================================
 ;[UserSelectMy] - This function shows the current XBee MYL in the display and
 ; 	then allows the user to enter new 16 bit hex address.
 ;	The Logical Enter key will use to save the new value and Esc/Cancel will
@@ -1990,6 +2086,7 @@ DisplayRemoteString[pstr, cbStr]
 		; BUGBUG: Should put this into a change mode function...
 		gosub ClearLCDDisplay
 		bTDataLast = 0xff		; make sure we will display something when it changes.
+		g_bTxStatusLast = 99;	; again force it to redraw
 		TransMode = TMODE_DATA
 	endif
 
@@ -2070,6 +2167,7 @@ PlayRemoteSounds[pstr, cbStr]
 bLCDX 		var	byte
 bLCDY		var byte
 bLCDChar	var	byte
+bLCDCharLast var byte
 bLCDNum		var	word
 
 abLCDBuff	var	byte(20)			; buffer to use to call TASeroutwith
@@ -2077,22 +2175,31 @@ cbLCDOut	var	word				; how many bytes to output
 
 DoLCDDisplay[bLCDX, bLCDY, bLCDChar, bLCDNum]
 
-	abLCDBuff = 254, 71, bLCDX, bLCDY		; filled in the start of the buffer with the LCD position stuff
 	if bLCDChar <> 0 then
 		abLCDBuff(4) = bLCDChar
 		cbLCDOut = 5
 	else
 		; May later handle +- types of numbers
-		abLCDBuff(4) = dec4 bLCDNum\4
+		; Bugbug: This is cr... but if 1,1 we will set to 2,1 and only do 3 digits as I want to reserve
+		; 1,1 to display the status of output characters...
+		if bLCDX = 1 and bLCDY = 1 then 
+			bLCDX = 2	; hack to save 1,1
+			bLCDCharLast = 6
+			abLCDBuff(4) = dec3 bLCDNum\3
+		else
+			bLCDCharLast = 7
+			abLCDBuff(4) = dec4 bLCDNum\4
+		endif	
 		bLCDChar = 4
-		while (bLCDChar < 7) and (abLCDBuff(bLCDChar) = "0")		; reuse the passed in char field as an index
+		while (bLCDChar < bLCDCharLast) and (abLCDBuff(bLCDChar) = "0")		; reuse the passed in char field as an index
 			abLCDBuff(bLCDChar) = " "		; remove leading zeros
 			bLCDChar = bLCDChar + 1
 		wend
-		cbLCDOut = 8
+		cbLCDOut = bLCDCharLast + 1
 	endif	
 
 	; now lets call our taserout function
+	abLCDBuff = 254, 71, bLCDX, bLCDY		; filled in the start of the buffer with the LCD position stuff
 	gosub TASerout[Display, i19200, @abLCDBuff, cbLCDOut]
 	
 
